@@ -13,6 +13,7 @@ import random
 import numpy as np
 
 from torch.utils.data import Dataset
+from models.enhanced_n2v_unet import get_e_unet_model
 
 
 
@@ -22,9 +23,8 @@ def create_blind_spot_input_fast(image, mask):
     blind_input = torch.where(mask > 0, noise, blind_input)
     return blind_input
 
-def train_stage1(img_size, model, train_loader, val_loader, criterion, optimizer, epochs=10, device='cuda', scratch=False, mask_ratio=0.1):
+def train_stage1(img_size, model, train_loader, val_loader, criterion, optimizer, epochs=10, device='cuda', scratch=False, mask_ratio=0.1, save_path=None, visualise=False):
 
-    visualise = False
     if not os.path.exists('checkpoints'):
         os.makedirs('checkpoints')
 
@@ -35,7 +35,7 @@ def train_stage1(img_size, model, train_loader, val_loader, criterion, optimizer
         print("Training from scratch")
     else:
         try:
-            checkpoint = torch.load(f'checkpoints/stage1_{img_size}_best_{str(model)}_model.pth')
+            checkpoint = torch.load(save_path)
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             old_epoch = checkpoint['epoch']
@@ -73,7 +73,10 @@ def train_stage1(img_size, model, train_loader, val_loader, criterion, optimizer
             
             optimizer.zero_grad()
             
-            outputs, features = model(blind_input)
+            try:
+                outputs, features = model(blind_input)
+            except:
+                outputs = model(blind_input)
 
             outputs = normalize_data(outputs)  
             
@@ -98,7 +101,7 @@ def train_stage1(img_size, model, train_loader, val_loader, criterion, optimizer
         
         # Update validation function to use N2V masking
         print("Validating")
-        val_loss = validate_n2v(model, val_loader, criterion, device, mask_ratio)
+        val_loss = validate_n2v(model, val_loader, criterion, device, mask_ratio, visualise=visualise)
         print("Validation finished")
 
         history['train_loss'].append(avg_train_loss)
@@ -118,7 +121,7 @@ def train_stage1(img_size, model, train_loader, val_loader, criterion, optimizer
                     'train_loss': avg_train_loss,
                     'val_loss': val_loss,
                     'history': history
-                }, f'checkpoints/stage1_{img_size}_best_{str(model)}_model.pth')
+                }, save_path)
             
             except:
                 print("Err")
@@ -133,7 +136,7 @@ def train_stage1(img_size, model, train_loader, val_loader, criterion, optimizer
                 'train_loss': avg_train_loss,
                 'val_loss': val_loss,
                 'history': history
-            }, f'checkpoints/stage1_{img_size}_last_{str(model)}_model.pth')
+            }, save_path)
         except:
             print("Err")
 
@@ -178,7 +181,7 @@ def group_images_for_stage1(image_list, grouping_function=None, group_size=None)
     return grouped_images
 
 
-def process_stage1(results, epochs=10):
+def process_stage1(results, epochs=10, stage1_path='checkpoints/stage1.pth', visualise=False):
 
     flow_masks = results['flow_components']
 
@@ -194,16 +197,16 @@ def process_stage1(results, epochs=10):
 
     train_loader, val_loader, test_loader = get_stage1_loaders(flow_masks_dataset, img_size)
 
-    sample = next(iter(test_loader))
-
-    device, model, criterion, optimizer = get_unet_model()
+    #device, model, criterion, optimizer = get_unet_model()
+    device, model, criterion, optimizer = get_e_unet_model()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3)
 
-    model, history = train_stage1(img_size, model, train_loader, val_loader, criterion, optimizer, epochs, device, scratch, mask_ratio=0.50)
-    model, history = train_stage1(img_size, model, train_loader, val_loader, criterion, optimizer, epochs, device, scratch, mask_ratio=0.10)
-    model, history = train_stage1(img_size, model, train_loader, val_loader, criterion, optimizer, epochs, device, scratch, mask_ratio=0.25)
+    model, history = train_stage1(img_size, model, train_loader, val_loader, criterion, optimizer, epochs, device, scratch, mask_ratio=0.50, save_path='checkpoints/stage1.pth', visualise=visualise)
+    model, history = train_stage1(img_size, model, train_loader, val_loader, criterion, optimizer, epochs, device, scratch, mask_ratio=0.25, save_path='checkpoints/stage1.pth')
+    model, history = train_stage1(img_size, model, train_loader, val_loader, criterion, optimizer, epochs, device, scratch, mask_ratio=0.10, save_path='checkpoints/stage1.pth')
+    
 
-    return model, history
+    return model, history, train_loader, val_loader, test_loader

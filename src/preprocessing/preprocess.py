@@ -94,6 +94,39 @@ def octa_preprocessing(preprocessed_data):
 
     return octa_images #list
 
+def octa_preprocessing_n_neighbours(preprocessed_data, window_size=3):
+    n_scans = len(preprocessed_data)
+    octa_images = []
+    
+    # Use a sliding window approach for multiple comparisons
+    for i in range(n_scans - window_size + 1):
+        # Get window of scans
+        window = preprocessed_data[i:i+window_size]
+        
+        # Compute average decorrelation across all pairs in window
+        avg_octa = None
+        pair_count = 0
+        
+        # Compare each scan with every other scan in the window
+        for j in range(window_size):
+            for k in range(j+1, window_size):
+                octa = compute_octa(window[j], window[k])
+                
+                if avg_octa is None:
+                    avg_octa = octa
+                else:
+                    avg_octa += octa
+                pair_count += 1
+        
+        # Average the decorrelation values
+        avg_octa /= pair_count
+        
+        # Apply thresholding to the average OCTA
+        thresholded_octa = threshold_octa(avg_octa, window[window_size//2])
+        octa_images.append(thresholded_octa)
+    
+    return octa_images
+
 def compute_octa(oct1, oct2):
 
     numerator = (oct1 - oct2)**2
@@ -110,7 +143,7 @@ def compute_octa(oct1, oct2):
 
 def threshold_octa(octa, oct):
 
-    background_mask = oct < np.percentile(oct, 95)  # Bottom 20% of OCT values
+    background_mask = oct > np.percentile(oct, 65)  # Bottom 20% of OCT values
     
     if np.sum(background_mask) > 0:  # Ensure we have background pixels
         background_mean = np.mean(oct[background_mask])
@@ -132,23 +165,33 @@ def pair_data(preprocessed_data, octa_data):
     preprocessed_data = preprocessed_data[:-1]  # Remove last scan to avoid out of bounds
 
     input_target = []
+    j = 0
     for p, o in zip(preprocessed_data, octa_data):
         input_target.append([p, o])
+        j += 1
+        if j >= 11:
+            break
 
     return input_target
 
 def preprocessing():
-    try:    
-        i = 1
-        data = load_patient_data(rf"C:\Datasets\ICIP training data\ICIP training data\0\RawDataQA ({i})")
+    dataset = {}
+    try:
+        for i in range(1,4):
+            data = load_patient_data(rf"C:\Datasets\ICIP training data\ICIP training data\0\RawDataQA ({i})")
 
-        preprocessed_data = standard_preprocessing(data)
+            preprocessed_data = standard_preprocessing(data)
 
-        octa_data = octa_preprocessing(preprocessed_data)
+            octa_data = octa_preprocessing(preprocessed_data)
+            #octa_data = octa_preprocessing_n_neighbours(preprocessed_data , window_size=2)
 
-        input_target_data = pair_data(preprocessed_data, octa_data)
+            input_target_data = pair_data(preprocessed_data, octa_data)
 
-        return input_target_data
+            dataset[i] = input_target_data
+
+            
+
+        return dataset
     
     except Exception as e:
         print(f"Error in preprocessing: {e}")

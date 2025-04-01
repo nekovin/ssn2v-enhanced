@@ -13,6 +13,9 @@ import torch.nn.functional as F
 import torch
 import torch.nn as nn
 from utils import normalize_image, get_stage1_loaders, get_unet_model, normalize_data
+from models.enhanced_n2v_unet import get_e_unet_model
+
+from ssm.ssm import SpeckleSeparationModule, SpeckleSeparationUNet
 
 
 def ssim_loss(img1, img2, window_size=11, size_average=True):
@@ -192,6 +195,44 @@ def normalize_data(data, target_min=0, target_max=1):
 
 mse_loss = nn.MSELoss()
 
+def threshold_octa(octa, method='adaptive', threshold_percentage=0.1):
+    """
+    Threshold OCTA image to remove low-intensity noise
+    
+    Args:
+    - octa: Input OCTA image tensor
+    - method: Thresholding method ('adaptive' or 'percentile')
+    - threshold_percentage: Percentage for percentile-based thresholding
+    
+    Returns:
+    - Thresholded OCTA image
+    """
+    # Ensure tensor is numpy or converted to numpy
+    if torch.is_tensor(octa):
+        octa = octa.detach().squeeze().cpu().numpy()
+    
+    if method == 'adaptive':
+        # Otsu's method for adaptive thresholding
+        from skimage.filters import threshold_otsu
+        threshold = threshold_otsu(octa)
+    elif method == 'percentile':
+        # Percentile-based thresholding
+        threshold = np.percentile(octa, (1 - threshold_percentage) * 100)
+    else:
+        # Default to percentile method
+        threshold = np.percentile(octa, (1 - threshold_percentage) * 100)
+    
+    # Create binary mask
+    #thresholded = (octa > threshold).astype(float)
+    octa_np = octa
+    thresholded = octa_np * (octa_np > threshold)
+    
+    # Convert back to tensor if needed
+    if not torch.is_tensor(octa):
+        thresholded = torch.from_numpy(thresholded).float()
+    
+    return thresholded.to('cuda')
+
 def compute_decorrelation(oct1, oct2):
 
     # Full-spectrum decorrelation as used in Jia et al. paper
@@ -201,6 +242,8 @@ def compute_decorrelation(oct1, oct2):
     # Add small epsilon to avoid division by zero
     epsilon = 1e-6
     octa = numerator / (denominator + epsilon)
+
+    #octa = threshold_octa(octa, method='percentile', threshold_percentage=0.01)
     
     return octa
 
@@ -292,8 +335,8 @@ def visualise_stage2(oct1, oct2, denoised_oct1, denoised_oct2, octa_constraint, 
     axes[0, 2].set_title('OCTA Constraint (Stage 1)')
     axes[0, 2].axis('off')
     
-    denoised_oct1_norm = normalize_image(denoised_oct1)
-    axes[1, 0].imshow(denoised_oct1_norm, cmap='gray')
+    #denoised_oct1_norm = normalize_image(denoised_oct1)
+    axes[1, 0].imshow(denoised_oct1, cmap='gray')
     axes[1, 0].set_title('Denoised OCT 1')
     axes[1, 0].axis('off')
     
@@ -628,29 +671,95 @@ def normalize_intensity(denoised, reference):
     
     return normalized
 
-def ssn2v_loss(denoised_oct1, denoised_oct2, oct1, oct2, octa_constraint, target_indices1, target_indices2):
+def ssn2v_loss(denoised_oct1, denoised_oct2, oct1, oct2, octa_constraint, target_indices1, target_indices2, computed_octa):
     # Step 1: N2V denoising loss (blind-spot training)
     n2v_loss1 = masked_mse_loss(denoised_oct1, oct1, target_indices1)
     n2v_loss2 = masked_mse_loss(denoised_oct2, oct2, target_indices2)
     denoising_loss = n2v_loss1 + n2v_loss2
     
     # Step 2: OCTA flow information preservation constraint
-    computed_octa = compute_decorrelation(denoised_oct1, denoised_oct2)
+    
     octa_loss = F.mse_loss(computed_octa, octa_constraint)
+    #octa_loss = gradient_aware_octa_loss(computed_octa, octa_constraint)
 
     intensity_loss = histogram_loss(denoised_oct1, oct1) + histogram_loss(denoised_oct2, oct2)
 
     
     # Combine losses - emphasize OCTA preservation
-    alpha = 5.0  # Weight for OCTA constraint (increase to preserve more flow information)
-    total_loss = denoising_loss + alpha * octa_loss + intensity_loss * 2
+    alpha = 5  # Weight for OCTA constraint (increase to preserve more flow information)
+    beta = 10
+    total_loss = denoising_loss + alpha * octa_loss + intensity_loss * beta
+
+    print(f"Loss components: {denoising_loss.item()}, {octa_loss.item()}, {intensity_loss.item()}")
+    print(f"Total loss: {total_loss.item()}")
+    
+    return total_loss, {"denoising_loss": denoising_loss.item(), "octa_loss": octa_loss.item()}
+
+def _ssn2v_loss(denoised_oct1, denoised_oct2, oct1, oct2, octa_constraint, target_indices1, target_indices2, computed_octa):
+    # Step 1: N2V denoising loss (blind-spot training)
+    n2v_loss1 = masked_mse_loss(denoised_oct1, oct1, target_indices1)
+    n2v_loss2 = masked_mse_loss(denoised_oct2, oct2, target_indices2)
+    denoising_loss = n2v_loss1 + n2v_loss2
+    
+    # Step 2: OCTA flow information preservation constraint
+    #computed_octa = compute_decorrelation(denoised_oct1, denoised_oct2)
+    #computed_octa = ssm(denoised_oct1.to('cuda'))['flow_component']
+    
+    # Simplify the OCTA loss - use basic MSE without gradients to reduce magnitude
+    #plt.imshow(computed_octa, cmap='gray')
+    #plt.imshow(octa_constraint, cmap='gray')
+    octa_loss = F.mse_loss(computed_octa, octa_constraint)
+    
+    # Or retain gradient awareness but scale components individually
+    # grad_x_loss = F.mse_loss(computed_grad_x, target_grad_x)
+    # grad_y_loss = F.mse_loss(computed_grad_y, target_grad_y)
+    # octa_loss = octa_mse + 0.1 * (grad_x_loss + grad_y_loss)  # Reduce gradient contribution
+    
+    intensity_loss = histogram_loss(denoised_oct1, oct1) + histogram_loss(denoised_oct2, oct2)
+    
+    # Apply log-scaling to reduce the impact of magnitude differences
+    log_denoising = torch.log1p(denoising_loss)
+    log_octa = torch.log1p(octa_loss)
+    log_intensity = torch.log1p(intensity_loss)
+    
+    alpha = 1.0  
+    beta = 1.0
+    
+    total_loss = log_denoising + alpha * log_octa + beta * log_intensity
+
+    print(f"Loss components: {denoising_loss.item()}, {octa_loss.item()}, {intensity_loss.item()}")
+    print(f"Total loss: {total_loss.item()}")
     
     return total_loss, {"denoising_loss": denoising_loss.item(), "octa_loss": octa_loss.item()}
 
 def histogram_loss(denoised, original):
     return F.mse_loss(torch.sort(denoised.flatten())[0], torch.sort(original.flatten())[0])
 
-def train_stage2(model, device, optimizer, data_loader, num_epochs=5, scheduler=None):
+def gradient_aware_octa_loss(computed_octa, octa_constraint):
+    # Calculate MSE
+    mse_loss = F.mse_loss(computed_octa, octa_constraint)
+    
+    # Calculate gradient preservation loss
+    computed_grad_x = computed_octa[:, :, :, 1:] - computed_octa[:, :, :, :-1]
+    computed_grad_y = computed_octa[:, :, 1:, :] - computed_octa[:, :, :-1, :]
+    
+    target_grad_x = octa_constraint[:, :, :, 1:] - octa_constraint[:, :, :, :-1]
+    target_grad_y = octa_constraint[:, :, 1:, :] - octa_constraint[:, :, :-1, :]
+    
+    grad_loss_x = F.mse_loss(computed_grad_x, target_grad_x)
+    grad_loss_y = F.mse_loss(computed_grad_y, target_grad_y)
+    
+    # Combined loss
+    return mse_loss + 1 * (grad_loss_x + grad_loss_y)
+
+def train_stage2(model, device, optimizer, train_loader, val_loader, num_epochs=5, scheduler=None, visualise=False):
+
+    ssm_path = "checkpoints/speckle_separation_model.pth"
+    ssm = SpeckleSeparationModule(input_channels=1, feature_dim=32)
+    ssm.load_state_dict(torch.load(ssm_path, map_location=device))
+    ssm.to(device)
+    ssm.eval()
+
     model.train()
     
     for epoch in range(num_epochs):
@@ -658,7 +767,7 @@ def train_stage2(model, device, optimizer, data_loader, num_epochs=5, scheduler=
 
         print(f"Epoch {epoch+1}/{num_epochs}")
         
-        for batch_idx, (oct1, oct2, octa_constraint) in enumerate(data_loader):
+        for batch_idx, (oct1, oct2, octa_constraint) in enumerate(train_loader):
             # Move to device
             oct1, oct2, octa_constraint = oct1.to(device), oct2.to(device), octa_constraint.to(device)
 
@@ -669,22 +778,34 @@ def train_stage2(model, device, optimizer, data_loader, num_epochs=5, scheduler=
             masked_oct2, mask2, target_indices2 = create_blindspot_mask(oct2)
             
             # Denoise each OCT image
-            denoised_oct1, _ = model(masked_oct1)
-            denoised_oct2, _ = model(masked_oct2)
+            try:
+                denoised_oct1, _ = model(masked_oct1)
+                denoised_oct2, _ = model(masked_oct2)
+            except:
+                denoised_oct1 = model(masked_oct1)
+                denoised_oct2 = model(masked_oct2)
 
             denoised_oct1 = normalize_intensity(denoised_oct1, oct1)
             denoised_oct2 = normalize_intensity(denoised_oct2, oct2)
             
 
             computed_octa = compute_decorrelation(denoised_oct1, denoised_oct2)
+            plt.imshow(computed_octa[0][0].detach().cpu().numpy(), cmap='gray')
 
+            #computed_octa = ssm(computed_octa)['flow_component']
+            #computed_octa_np = computed_octa.detach().cpu().numpy()
+            #normalized_octa = normalize_image(computed_octa_np)
+            #octa_sample = normalized_octa[0][0] 
+            #computed_octa_tensor = torch.tensor(octa_sample, device=device)
+            #computed_octa = normalize_image(computed_octa.detach().cpu().numpy())[0][0].to(device)
             #print(f"Masked pixels: {len(target_indices1[0])}, Unique positions: {len(set((y,x) for y,x in target_indices1[0]))}")
 
             total_loss, loss_components = ssn2v_loss(
                 denoised_oct1, denoised_oct2, 
                 oct1, oct2, 
                 octa_constraint,
-                target_indices1, target_indices2
+                target_indices1, target_indices2,
+                computed_octa
             )
             
             # Backpropagation
@@ -692,21 +813,21 @@ def train_stage2(model, device, optimizer, data_loader, num_epochs=5, scheduler=
             total_loss.backward()
             optimizer.step()
 
-            visualise = True
             if visualise and epoch % 2 == 0:
                 print(f"Batch {batch_idx}, Loss: {total_loss.item():.4f}")
-                #visualise_masks(oct1[0], oct2[0], masked_oct1[0], masked_oct2[0], mask1[0], mask2[0])
-                # clear output
                 from IPython.display import clear_output
                 clear_output()
                 visualise_stage2(oct1[0], oct2[0], denoised_oct1[0], denoised_oct2[0], 
-                                octa_constraint[0], computed_octa[0])
+                                octa_constraint[0], computed_octa)
                 
                 
         epoch_loss += total_loss.item()
 
-        epoch_loss /= len(data_loader)  # Divide by number of batches
-        scheduler.step(epoch_loss)
+        val_loss, val_psnr = validate(model, device, val_loader, ssm)
+
+        epoch_loss /= len(train_loader)  # Divide by number of batches
+
+        scheduler.step(val_loss)
 
 import torch
 
@@ -727,26 +848,27 @@ def apply_model(model, oct1, oct2, device):
     masked_oct1, mask1, target_indices1 = create_blindspot_mask(oct1)
     masked_oct2, mask2, target_indices2 = create_blindspot_mask(oct2)
 
-    denoised_oct1, _ = model(masked_oct1)
-    denoised_oct2, _ = model(masked_oct2)
+    try:
+        denoised_oct1, _ = model(masked_oct1)
+        denoised_oct2, _ = model(masked_oct2)
+    except:
+        denoised_oct1 = model(masked_oct1)
+        denoised_oct2 = model(masked_oct2)
 
     denoised_oct1 = normalize_intensity(denoised_oct1, oct1)
     denoised_oct2 = normalize_intensity(denoised_oct2, oct2)
 
     return denoised_oct1, denoised_oct2
 
-def process_stage2(results, epochs=10):
+
+
+
+def _process_stage2(results, model, history, train_loader, val_loader, test_loader, epochs=1, stage1_path='checkpoints/stage1.pth', visualise=False):
+
 
     stage2_data = []
-    for i in range(len(results)):
-        print(i)
-        raw_image = results['raw_image'][i]
-        flow_image = results['flow_components'][i]
-        stage2_data.append([raw_image, flow_image])
-        break
-
-    stage2_data = []
-    for i in range(len(results) - 1):
+    n = 20  # Number of samples to process
+    for i in range(n):
 
         oct1 = results['raw_image'][i]
         oct2 = results['raw_image'][i+1]  
@@ -756,20 +878,49 @@ def process_stage2(results, epochs=10):
         
         stage2_data.append((oct1, oct2, denoised_octa))
 
-    #model_path = r"checkpoints/stage1_256_best_N2NUNet_model.pth"
-    model_path = r"C:\temp\checkpoints\stage1_256_best_N2NUNet_model.pth"
+    print("Stage 2 data length: ", len(stage2_data))
 
-    device, model, criterion, optimizer = get_unet_model()
 
-    checkpoint = torch.load(model_path)
+    #device, model, criterion, optimizer = get_unet_model()
+    device, model, criterion, optimizer = get_e_unet_model()
+
+    checkpoint = torch.load(stage1_path)
     model.load_state_dict(checkpoint["model_state_dict"])
     print("Model loaded")
 
     mse_loss = nn.MSELoss()
-
+    '''
     dataset = OCTDenoiseDataset(stage2_data, device)
     batch_size = 1  # Adjust as needed
-    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)'''
+
+    from torch.utils.data import DataLoader, random_split
+
+    # Create the full dataset
+    dataset = OCTDenoiseDataset(stage2_data, device)
+
+    # Define the size of each split
+    dataset_size = len(dataset)
+    train_size = int(0.7 * dataset_size)  # 70% for training
+    val_size = int(0.15 * dataset_size)   # 15% for validation
+    test_size = dataset_size - train_size - val_size  # Remaining for testing
+
+    # Split the dataset
+    train_dataset, val_dataset, test_dataset = random_split(
+        dataset, 
+        [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(42)  # For reproducibility
+    )
+
+    # Create data loaders for each split
+    batch_size = 1  # Adjust as needed
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0) 
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    
+    print(f"Train size: {len(train_loader.dataset)}, Validation size: {len(val_loader.dataset)}, Test size: {len(test_loader.dataset)}")
+    assert len(train_loader) > 0, "Train loader is empty!"
+    assert len(val_loader) > 0, "Validation loader is empty!"
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3)
 
@@ -779,11 +930,634 @@ def process_stage2(results, epochs=10):
         if 'down' in name:  # Only train the decoder part
             param.requires_grad = False
 
-    train_stage2(model2, device, optimizer, data_loader, num_epochs=epochs, scheduler=scheduler)
+    train_stage2(model2, device, optimizer, train_loader, val_loader, num_epochs=epochs, scheduler=scheduler, visualise=visualise)
 
-    model_path = r"checkpoints/stage2_256_final_N2NUNet_model.pth"
+    save_path = r"checkpoints/stage2_256_final_N2NUNet_model.pth"
 
-    torch.save({'model_state_dict': model.state_dict(),}, model_path)
+    torch.save({'model_state_dict': model.state_dict(),}, save_path)
 
     denoised_oct1, denoised_oct2 = apply_model(model2, oct1, oct2, device)
     return denoised_oct1, denoised_oct2
+
+def validate(model, device, data_loader, ssm):
+    """
+    Validate the model on a validation dataset.
+    
+    Args:
+        model: The neural network model
+        device: The device to run validation on (CPU or GPU)
+        data_loader: DataLoader for validation data
+        
+    Returns:
+        avg_loss: Average loss over the validation set
+        avg_psnr: Average PSNR over the validation set
+    """
+    model.eval()  # Set model to evaluation mode
+    total_loss = 0.0
+    total_psnr = 0.0
+    
+    with torch.no_grad():  # No need to track gradients
+        for batch_idx, (oct1, oct2, octa_constraint) in enumerate(data_loader):
+            # Move to device
+            oct1, oct2, octa_constraint = oct1.to(device), oct2.to(device), octa_constraint.to(device)
+            
+            # Create masked versions of OCT images for N2V training
+            masked_oct1, mask1, target_indices1 = create_blindspot_mask(oct1)
+            masked_oct2, mask2, target_indices2 = create_blindspot_mask(oct2)
+            
+            # Denoise each OCT image
+            try:
+                denoised_oct1, _ = model(masked_oct1)
+                denoised_oct2, _ = model(masked_oct2)
+            except:
+                denoised_oct1 = model(masked_oct1)
+                denoised_oct2 = model(masked_oct2)
+            
+            denoised_oct1 = normalize_intensity(denoised_oct1, oct1)
+            denoised_oct2 = normalize_intensity(denoised_oct2, oct2)
+            
+            computed_octa = compute_decorrelation(denoised_oct1, denoised_oct2)
+            #computed_octa = ssm(denoised_oct1.to('cuda'))['flow_component']
+            #computed_octa_np = computed_octa.detach().cpu().numpy()
+            #normalized_octa = normalize_image(computed_octa_np)
+            #octa_sample = normalized_octa[0][0] 
+            #computed_octa_tensor = torch.tensor(octa_sample, device=device)
+            
+            # Calculate loss
+            loss, _ = ssn2v_loss(
+                denoised_oct1, denoised_oct2, 
+                oct1, oct2, 
+                octa_constraint,
+                target_indices1, target_indices2,
+                computed_octa
+            )
+            
+            # Calculate PSNR
+            mse1 = torch.mean((denoised_oct1 - oct1) ** 2)
+            mse2 = torch.mean((denoised_oct2 - oct2) ** 2)
+            avg_mse = (mse1 + mse2) / 2
+            psnr = 10 * torch.log10(1.0 / avg_mse)
+            
+            total_loss += loss.item()
+            total_psnr += psnr.item()
+    
+    # Calculate averages
+    avg_loss = total_loss / len(data_loader)
+    avg_psnr = total_psnr / len(data_loader)
+    
+    return avg_loss, avg_psnr
+
+# import random split
+from torch.utils.data import random_split
+
+def process_stage2(results, model, history, train_loader, val_loader, test_loader, epochs=1, stage1_path='checkpoints/stage1.pth', visualise=False, load=False):
+    # Prepare stage 2 data
+    stage2_data = []
+    n = min(10, len(results['raw_image']) - 1)  # Ensure we don't go out of bounds
+    for i in range(n):
+        oct1 = results['raw_image'][i]
+        oct2 = results['raw_image'][i+1]  
+        denoised_octa = results['flow_components'][i]
+        
+        stage2_data.append((oct1, oct2, denoised_octa))
+
+    print(f"Stage 2 data length: {len(stage2_data)}")
+
+    # Device and model setup
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    _, model, _, optimizer = get_e_unet_model()
+
+    # Load stage 1 checkpoint
+    if load:
+        checkpoint = torch.load(r"C:\Users\CL-11\OneDrive\Repos\OCTDenoisingFinal\src\checkpoints\stage2_256_final_N2NUNet_model_backup.pth", map_location=device)
+    else:
+        checkpoint = torch.load(stage1_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    print("Stage 1 model loaded")
+
+    # Create dataset and data loaders
+    dataset = OCTDenoiseDataset(stage2_data, device)
+    dataset_size = len(dataset)
+    
+    # Precise data splitting
+    train_size = int(0.8 * dataset_size)
+    val_size = int(0.1 * dataset_size)
+    test_size = dataset_size - train_size - val_size
+
+    train_dataset, val_dataset, test_dataset = random_split(
+        dataset, 
+        [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+
+    # Data loader configuration
+    batch_size = 1
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0) 
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    
+    # Logging dataset sizes
+    print(f"Train size: {len(train_loader.dataset)}, "
+          f"Validation size: {len(val_loader.dataset)}, "
+          f"Test size: {len(test_loader.dataset)}")
+    
+    # Sanity checks
+    assert len(train_loader) > 0, "Train loader is empty!"
+    assert len(val_loader) > 0, "Validation loader is empty!"
+
+    # Optimizer and scheduler
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3)
+
+    # Partial model freezing (optional)
+    for name, param in model.named_parameters():
+        if 'down' in name:  # Only train the decoder part
+            param.requires_grad = False
+
+    # Stage 2 training
+    model = train_stage2(
+        model, 
+        device, 
+        optimizer, 
+        train_loader, 
+        val_loader, 
+        num_epochs=epochs, 
+        scheduler=scheduler, 
+        visualise=visualise
+    )
+
+    # Save model
+    save_path = "checkpoints/stage2_256_final_N2NUNet_model.pth"
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict()
+    }, save_path)
+
+    # Apply model to sample images
+    denoised_oct1, denoised_oct2 = apply_model(model, oct1, oct2, device)
+    
+    return denoised_oct1, denoised_oct2
+
+###
+
+
+class Noise2VoidLoss(nn.Module):
+    def __init__(self, mask_ratio=0.1):
+        super(Noise2VoidLoss, self).__init__()
+        self.mask_ratio = mask_ratio
+        self.mse = nn.MSELoss(reduction='none')
+
+    def forward(self, prediction, target):
+        # Create a binary mask where 1 indicates masked pixels
+        mask = torch.bernoulli(torch.full_like(target, self.mask_ratio)).bool()
+        
+        # Compute pixel-wise MSE loss
+        pixel_losses = self.mse(prediction, target)
+        
+        # Only compute loss for masked pixels
+        masked_losses = pixel_losses[mask]
+        
+        # Avoid division by zero
+        if masked_losses.numel() == 0:
+            return torch.tensor(0.0, device=prediction.device)
+        
+        # Compute mean loss over masked pixels
+        loss = masked_losses.mean()
+        
+        return loss
+
+def train_stage2(model, device, optimizer, train_loader, val_loader, num_epochs=5, scheduler=None, visualise=False):
+
+    ssm_path = "checkpoints/speckle_separation_model.pth"
+    ssm = SpeckleSeparationModule(input_channels=1, feature_dim=32)
+    #ssm = SpeckleSeparationUNet(input_channels=1, feature_dim=32)
+    ssm.load_state_dict(torch.load(ssm_path, map_location=device))
+    ssm.to(device)
+    ssm.eval()
+
+    
+    
+    for epoch in range(num_epochs):
+        model.train()
+
+        epoch_loss = 0.0
+        
+        for batch_idx, (oct1, oct2, octa_constraint) in enumerate(train_loader):
+            print("Training", "Epoch: ", epoch, "Batch: ", batch_idx)
+            # Move to device
+            oct1, oct2, octa_constraint = oct1.to(device), oct2.to(device), octa_constraint.to(device)
+            
+            # Create masked versions using N2V approach
+            masked_oct1, mask1, target_indices1 = create_blindspot_mask_fast(oct1)
+            masked_oct2, mask2, target_indices2 = create_blindspot_mask_fast(oct2)
+            
+            
+            # Denoise images
+            denoised_oct1 = model(masked_oct1)
+            denoised_oct2 = model(masked_oct2)
+            
+            # Compute OCTA 
+            computed_octa = compute_decorrelation(denoised_oct1, denoised_oct2)
+            #computed_octa = ssm(denoised_oct1)['flow_component']
+            
+            
+            # Compute loss using the custom loss function
+            total_loss = compute_stage2_loss(
+                denoised_oct1, denoised_oct2, 
+                oct1, oct2, 
+                octa_constraint, 
+                computed_octa,
+                target_indices1,
+                target_indices2
+            )
+            
+            # Optimization step
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+            
+            epoch_loss += total_loss.item()
+            
+            # Optional visualization
+            if visualise:
+                # clear
+                from IPython.display import clear_output
+                clear_output(wait=True)
+                visualise_stage2(
+                    oct1, oct2, 
+                    denoised_oct1, denoised_oct2, 
+                    octa_constraint, 
+                    computed_octa
+                )
+        
+        # Validation
+        val_loss = validate_stage2(model, val_loader)
+        
+        # Learning rate scheduling
+        if scheduler:
+            scheduler.step(val_loss)
+    
+    return model
+
+def compute_n2v_loss(denoised, original, target_indices):
+    """
+    Compute Noise2Void loss for specific masked indices
+    
+    Args:
+    - denoised: Denoised image tensor
+    - original: Original image tensor
+    - target_indices: Indices of masked pixels
+    
+    Returns:
+    - Loss value for masked pixels
+    """
+    # Ensure tensors are on the same device
+    denoised = denoised.to(original.device)
+    
+    # Check if target_indices is a tuple or list (from create_blindspot_mask)
+    if isinstance(target_indices, tuple) or isinstance(target_indices, list):
+        # Assuming target_indices is a tuple of (batch_indices, row_indices, col_indices)
+        batch_indices, row_indices, col_indices = target_indices
+        
+        # Create a mask tensor
+        mask = torch.zeros_like(original, dtype=torch.bool)
+        mask[batch_indices, 0, row_indices, col_indices] = True
+        
+        # Extract masked values
+        denoised_masked = denoised[mask]
+        original_masked = original[mask]
+    else:
+        # If target_indices is already a mask
+        mask = target_indices
+        denoised_masked = denoised[mask]
+        original_masked = original[mask]
+    
+    # Compute MSE loss for masked pixels
+    if denoised_masked.numel() > 0:
+        n2v_loss = F.mse_loss(denoised_masked, original_masked)
+    else:
+        n2v_loss = torch.tensor(0.0, device=original.device)
+    
+    return n2v_loss
+
+def validate_stage2(model, val_loader):
+    """
+    Validate the model on validation dataset
+    
+    Args:
+    - model: Trained model
+    - val_loader: Validation data loader
+    
+    Returns:
+    - Average validation loss
+    """
+    model.eval()
+    total_val_loss = 0.0
+
+    device = 'cuda'
+    
+    with torch.no_grad():
+        for oct1, oct2, octa_constraint in val_loader:
+
+            print("Validating")
+
+            oct1 = oct1.to(device)
+            oct2 = oct2.to(device)
+            octa_constraint = octa_constraint.to(device)
+            # Perform validation similar to training
+            masked_oct1, _, target_indices1 = create_blindspot_mask(oct1)
+            masked_oct2, _, target_indices2 = create_blindspot_mask(oct2)
+            
+            denoised_oct1 = model(masked_oct1)
+            denoised_oct2 = model(masked_oct2)
+            
+            computed_octa = compute_decorrelation(denoised_oct1, denoised_oct2)
+            
+            val_loss = compute_stage2_loss(
+                denoised_oct1, denoised_oct2, 
+                oct1, oct2, 
+                octa_constraint, 
+                computed_octa,
+                target_indices1,
+                target_indices2
+            )
+            
+            total_val_loss += val_loss.item()
+    
+    avg_val_loss = total_val_loss / len(val_loader)
+    return avg_val_loss
+
+def compute_n2v_loss(denoised, original, target_indices):
+    """
+    Compute Noise2Void loss for specific masked indices
+    
+    Args:
+    - denoised: Denoised image tensor
+    - original: Original image tensor
+    - target_indices: Tuple of indices where mask was applied
+    
+    Returns:
+    - Loss value for masked pixels
+    """
+    # Unpack target indices
+    batch_indices, row_indices, col_indices = target_indices
+    
+    # Extract masked pixel values
+    denoised_masked = denoised[batch_indices, 0, row_indices, col_indices]
+    original_masked = original[batch_indices, 0, row_indices, col_indices]
+    
+    # Compute MSE loss for masked pixels
+    if denoised_masked.numel() > 0:
+        n2v_loss = F.mse_loss(denoised_masked, original_masked)
+    else:
+        n2v_loss = torch.tensor(0.0, device=original.device)
+    
+    return n2v_loss
+
+def compute_stage2_loss(denoised_oct1, denoised_oct2, 
+                         original_oct1, original_oct2, 
+                         octa_constraint, 
+                         computed_octa,
+                         target_indices1,
+                         target_indices2):
+    """
+    Comprehensive loss computation for stage 2 training
+    """
+    # Ensure tensors are on the same device
+    device = original_oct1.device
+    
+    # Normalize tensors to prevent extreme values
+    denoised_oct1 = normalize_tensor(denoised_oct1)
+    denoised_oct2 = normalize_tensor(denoised_oct2)
+    original_oct1 = normalize_tensor(original_oct1)
+    original_oct2 = normalize_tensor(original_oct2)
+    octa_constraint = normalize_tensor(octa_constraint)
+    computed_octa = normalize_tensor(computed_octa)
+    
+    # N2V Loss with gradient clipping
+    n2v_loss = compute_n2v_loss(denoised_oct1, original_oct1, target_indices1)
+    n2v_loss += compute_n2v_loss(denoised_oct2, original_oct2, target_indices2)
+    
+    # OCTA Constraint Loss with reduction
+    octa_loss = F.mse_loss(computed_octa, octa_constraint, reduction='mean')
+    
+    # Denoising Quality Loss with regularization
+    denoising_loss = F.mse_loss(denoised_oct1, original_oct1) + F.mse_loss(denoised_oct2, original_oct2)
+
+    #diversity_loss = torch.std(denoised)
+
+    feature_loss = torch.nn.functional.l1_loss(denoised_oct1, original_oct1) + torch.nn.functional.l1_loss(denoised_oct2, original_oct2)
+
+    alpha, beta, gamma, delta = 0,0,0,0
+
+    #alpha = 0.05
+    beta = 0.5
+    gamma = 0.25
+    delta = 0.25
+
+    # Loss weighting
+    total_loss = (
+        alpha * n2v_loss + 
+        beta * octa_loss + 
+        gamma * denoising_loss +
+        delta * feature_loss
+    )
+
+    print(f"Loss components: N2V: {n2v_loss.item()}, OCTA: {octa_loss.item()}, Denoising: {denoising_loss.item()}, Feature: {feature_loss.item()}")
+    print(f"Total loss: {total_loss.item()}")
+    
+    return total_loss
+
+def normalize_tensor(tensor, min_val=0, max_val=1):
+    """
+    Normalize tensor to a specified range
+    
+    Args:
+    - tensor: Input tensor
+    - min_val: Minimum value after normalization
+    - max_val: Maximum value after normalization
+    
+    Returns:
+    - Normalized tensor
+    """
+    tensor = tensor.clone()
+    
+    # Handle single-channel images
+    if len(tensor.shape) == 3:
+        tensor = tensor.unsqueeze(1)
+    
+    # Compute min and max for each image in the batch
+    batch_min = tensor.view(tensor.size(0), -1).min(dim=1)[0].view(-1, 1, 1, 1)
+    batch_max = tensor.view(tensor.size(0), -1).max(dim=1)[0].view(-1, 1, 1, 1)
+    
+    # Normalize to [0, 1]
+    tensor = (tensor - batch_min) / (batch_max - batch_min + 1e-8)
+    
+    # Scale to desired range
+    tensor = tensor * (max_val - min_val) + min_val
+    
+    return tensor
+
+def create_blindspot_mask(tensor, mask_ratio=0.1):
+    """
+    Create a blindspot mask for Noise2Void training
+    
+    Args:
+    - tensor: Input tensor
+    - mask_ratio: Proportion of pixels to mask
+    
+    Returns:
+    - masked_tensor: Tensor with some pixels replaced
+    - mask: Boolean mask of masked pixels
+    - target_indices: Indices of masked pixels
+    """
+    # Ensure tensor is 4D (B, C, H, W)
+    if len(tensor.shape) == 3:
+        tensor = tensor.unsqueeze(0)
+    
+    B, C, H, W = tensor.shape
+    device = tensor.device
+    
+    # Create a mask
+    mask = torch.rand(B, C, H, W, device=device) < mask_ratio
+    
+    # Clone the original tensor
+    masked_tensor = tensor.clone()
+    
+    # Find indices of masked pixels
+    batch_indices, channel_indices, row_indices, col_indices = torch.where(mask)
+    
+    # Replace masked pixels with random values from neighboring pixels
+    for b, c, h, w in zip(batch_indices, channel_indices, row_indices, col_indices):
+        # Create a neighborhood window with safe indexing
+        h_start = max(0, h-1)
+        h_end = min(H, h+2)
+        w_start = max(0, w-1)
+        w_end = min(W, w+2)
+        
+        neighborhood = tensor[b, c, h_start:h_end, w_start:w_end]
+        
+        # Ensure neighborhood is not empty
+        if neighborhood.numel() > 0:
+            # Flatten neighborhood and select random pixel
+            flat_neighborhood = neighborhood.flatten()
+            replacement_idx = torch.randint(len(flat_neighborhood), (1,), device=device)
+            replacement = flat_neighborhood[replacement_idx]
+            
+            # Assign replacement value
+            masked_tensor[b, c, h, w] = replacement
+    
+    # Return masked tensor, mask, and indices
+    return masked_tensor, mask, (batch_indices, row_indices, col_indices)
+
+def compute_n2v_loss(denoised, original, target_indices):
+    """
+    Compute Noise2Void loss for specific masked indices
+    
+    Args:
+    - denoised: Denoised image tensor
+    - original: Original image tensor
+    - target_indices: Tuple of indices where mask was applied
+    
+    Returns:
+    - Loss value for masked pixels
+    """
+    # Ensure 4D tensors
+    if len(denoised.shape) == 3:
+        denoised = denoised.unsqueeze(0)
+        original = original.unsqueeze(0)
+    
+    # Unpack target indices
+    batch_indices, row_indices, col_indices = target_indices
+    
+    # Extract masked pixel values
+    # Use first channel for grayscale images
+    denoised_masked = denoised[batch_indices, 0, row_indices, col_indices]
+    original_masked = original[batch_indices, 0, row_indices, col_indices]
+    
+    # Compute MSE loss for masked pixels
+    if denoised_masked.numel() > 0:
+        n2v_loss = F.mse_loss(denoised_masked, original_masked)
+    else:
+        n2v_loss = torch.tensor(0.0, device=original.device)
+    
+    return n2v_loss
+
+def create_blindspot_mask_fast(tensor, mask_ratio=0.1):
+    """
+    Create a blindspot mask for Noise2Void training (fast version)
+    
+    Args:
+    - tensor: Input tensor
+    - mask_ratio: Proportion of pixels to mask
+    
+    Returns:
+    - masked_tensor: Tensor with some pixels replaced
+    - mask: Boolean mask of masked pixels
+    - target_indices: Indices of masked pixels
+    """
+    # Ensure tensor is 4D (B, C, H, W)
+    if len(tensor.shape) == 3:
+        tensor = tensor.unsqueeze(0)
+    
+    B, C, H, W = tensor.shape
+    device = tensor.device
+    
+    # Create a mask
+    mask = torch.rand(B, 1, H, W, device=device) < mask_ratio
+    mask = mask.expand(-1, C, -1, -1)
+    
+    # Clone the original tensor
+    masked_tensor = tensor.clone()
+    
+    # Create shifted tensors in 4 directions
+    shifts = [(0, 1), (0, -1), (1, 0), (-1, 0)]
+    neighbors = []
+    
+    for dy, dx in shifts:
+        # Create padded tensor
+        padded = torch.nn.functional.pad(
+            tensor, 
+            (max(0, dx), max(0, -dx), max(0, dy), max(0, -dy)),
+            mode='replicate'
+        )
+        
+        # Get shifted values
+        if dx > 0:
+            padded = padded[:, :, :, :-dx]
+        elif dx < 0:
+            padded = padded[:, :, :, -dx:]
+            
+        if dy > 0:
+            padded = padded[:, :, :-dy, :]
+        elif dy < 0:
+            padded = padded[:, :, -dy:, :]
+            
+        neighbors.append(padded)
+    
+    # Stack all neighbors
+    all_neighbors = torch.stack(neighbors, dim=0)
+    
+    # Randomly select one neighbor for each pixel
+    rand_indices = torch.randint(len(shifts), (B, 1, H, W), device=device)
+    rand_indices = rand_indices.expand(-1, C, -1, -1)
+    
+    # Create replacement tensor
+    replacements = torch.gather(
+        all_neighbors, 
+        0, 
+        rand_indices.unsqueeze(0).expand(len(shifts), -1, -1, -1, -1)
+    )[0]
+    
+    # Apply mask
+    masked_tensor = torch.where(mask, replacements, tensor)
+    
+    # Find indices of masked pixels for later use
+    batch_indices, channel_indices, row_indices, col_indices = torch.where(mask)
+    
+    # Return as in the original function but with unique pixel indices
+    # (taking only indices for first channel)
+    mask_points = torch.nonzero(mask[:, 0, :, :], as_tuple=True)
+    batch_indices, row_indices, col_indices = mask_points
+    
+    return masked_tensor, mask, (batch_indices, row_indices, col_indices)

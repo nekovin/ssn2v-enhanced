@@ -2,6 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import functional as F
+import os 
+import sys
+sys.path.append(r"C:\Users\CL-11\OneDrive\Repos\OCTDenoisingFinal\src")
+from loss import Noise2VoidLoss
 
 
 class ResDoubleConv(nn.Module):

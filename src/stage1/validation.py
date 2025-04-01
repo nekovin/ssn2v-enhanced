@@ -76,11 +76,9 @@ def visualise_n2v(blind_input, target_img, output, mask=None):
     plt.tight_layout()
     plt.show()
 
-def validate_n2v(model, val_loader, criterion, device='cuda', mask_ratio=0.1):
+def validate_n2v(model, val_loader, criterion, device='cuda', mask_ratio=0.1, visualise=False):
     model.eval()
     total_loss = 0.0
-
-    visualise = False
     
     with torch.no_grad():
         for noisy_img1, noisy_img2 in val_loader:
@@ -93,7 +91,11 @@ def validate_n2v(model, val_loader, criterion, device='cuda', mask_ratio=0.1):
             # Create blind spot input
             blind_input = create_blind_spot_input_fast(noisy_img1, mask)
             
-            outputs, features = model(blind_input)
+            try:
+                outputs, features = model(blind_input)
+            except:
+                outputs = model(blind_input)
+                
             outputs = normalize_data(outputs)  
             loss = criterion(outputs, noisy_img1)
             
